@@ -46,22 +46,21 @@ if original is None:
 
 st.subheader('Asociar columnas')
 col1,col2=st.columns(2)
-with col1:
 
-columnas = list(original.columns)
+    with col1:
+        columnas = list(original.columns)
+        preferida = next(
+            (c for c in columnas if str(c).strip().upper() == "MANUFACT_ITEMNUM"),
+            columnas[0]
+        )
+        ref_col = st.selectbox(
+            "Columna de referencia de tu Excel",
+            columnas,
+            index=columnas.index(preferida)
+        )
 
-preferida = next(
-    (c for c in columnas if c.strip().upper() == "MANUFACT_ITEMNUM"),
-    columnas[0]
-)
+    with col2:
 
-ref_col = st.selectbox(
-    "Columna de referencia de tu Excel",
-    columnas,
-    index=columnas.index(preferida)
-)
-
-with col2:
     maker_col=st.selectbox('Columna de fabricante (opcional)', ['(Sin columna)']+list(original.columns))
 
 st.subheader('Conexión pública EUDAMED')
