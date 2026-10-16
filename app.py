@@ -44,7 +44,6 @@ if original is None:
     st.write('Carga un archivo para comenzar. Puedes probar con el Excel de ejemplo incluido en el paquete.')
     st.stop()
 
-
 st.subheader('Asociar columnas')
 col1, col2 = st.columns(2)
 
