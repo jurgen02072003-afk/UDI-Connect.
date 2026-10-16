@@ -44,24 +44,27 @@ if original is None:
     st.write('Carga un archivo para comenzar. Puedes probar con el Excel de ejemplo incluido en el paquete.')
     st.stop()
 
+
 st.subheader('Asociar columnas')
-col1,col2=st.columns(2)
+col1, col2 = st.columns(2)
 
-    with col1:
-        columnas = list(original.columns)
-        preferida = next(
-            (c for c in columnas if str(c).strip().upper() == "MANUFACT_ITEMNUM"),
-            columnas[0]
-        )
-        ref_col = st.selectbox(
-            "Columna de referencia de tu Excel",
-            columnas,
-            index=columnas.index(preferida)
-        )
+with col1:
+    columnas = list(original.columns)
+    preferida = next(
+        (c for c in columnas if str(c).strip().upper() == "MANUFACT_ITEMNUM"),
+        columnas[0]
+    )
+    ref_col = st.selectbox(
+        "Columna de referencia de tu Excel",
+        columnas,
+        index=columnas.index(preferida)
+    )
 
-    with col2:
-
-    maker_col=st.selectbox('Columna de fabricante (opcional)', ['(Sin columna)']+list(original.columns))
+with col2:
+    maker_col = st.selectbox(
+        'Columna de fabricante (opcional)',
+        ['(Sin columna)'] + list(original.columns)
+    )
 
 st.subheader('Conexión pública EUDAMED')
 api_mode = st.checkbox('Consultar EUDAMED directamente (API oficial)', value=False)
