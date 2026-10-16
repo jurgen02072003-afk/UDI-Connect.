@@ -47,7 +47,20 @@ if original is None:
 st.subheader('Asociar columnas')
 col1,col2=st.columns(2)
 with col1:
-    ref_col=st.selectbox('Columna de referencia de tu Excel',list(original.columns),index=next((i for i,c in enumerate(original.columns) if 'ref' in c.lower() or 'item' in c.lower()),0))
+
+columnas = list(original.columns)
+
+preferida = next(
+    (c for c in columnas if c.strip().upper() == "MANUFACT_ITEMNUM"),
+    columnas[0]
+)
+
+ref_col = st.selectbox(
+    "Columna de referencia de tu Excel",
+    columnas,
+    index=columnas.index(preferida)
+)
+
 with col2:
     maker_col=st.selectbox('Columna de fabricante (opcional)', ['(Sin columna)']+list(original.columns))
 
