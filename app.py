@@ -1,11 +1,15 @@
 
 import io
 import re
+import time
+from datetime import datetime, timezone
+
 import pandas as pd
 import requests
+import streamlit as st
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
-import streamlit as st
+
 
 st.set_page_config(
     page_title="UDI Connect",
@@ -16,19 +20,20 @@ st.set_page_config(
 st.title("UDI Connect")
 st.caption(
     "Consulta de referencias de fabricantes "
-    "en el registro público de EUDAMED"
+    "en los datos públicos de EUDAMED"
 )
 
 st.info(
-    "UDI-DI, Basic UDI-DI y Master UDI-DI "
-    "son identificadores diferentes. "
-    "Los resultados requieren validación regulatoria."
+    "La búsqueda utiliza el SRN y la referencia "
+    "del fabricante. Los resultados deben "
+    "verificarse antes de comunicarlos a AEMPS."
 )
 
-BASE = (
-    "https://ec.europa.eu/tools/eudamed/"
-    "api/devices/udiDiData"
+API = (
+    "https://api.datalake.sante.service.ec.europa.eu"
+    "/eudamed/udi"
 )
+
 PUBLIC = (
     "https://ec.europa.eu/tools/eudamed/"
     "#/screen/search-device"
@@ -41,47 +46,49 @@ def norm(value):
     ).upper().replace("–", "-").replace("—", "-")
 
 
-def read_file(upload):
-    data = upload.getvalue()
+def as_text(value):
+    if value is None or pd.isna(value):
+        return ""
+    return str(value).strip()
+
+
+def load_file(upload):
+    raw = upload.getvalue()
 
     if upload.name.lower().endswith(".csv"):
-        for encoding in ("utf-8-sig", "latin-1"):
+        for enc in ("utf-8-sig", "latin-1"):
             try:
                 return pd.read_csv(
-                    io.BytesIO(data),
+                    io.BytesIO(raw),
                     dtype=str,
                     sep=None,
                     engine="python",
-                    encoding=encoding
-                ).fillna("")
-            except (UnicodeError, pd.errors.ParserError):
-                continue
+                    encoding=enc,
+                    keep_default_na=False
+                )
+            except (
+                UnicodeError,
+                pd.errors.ParserError
+            ):
+                pass
 
         raise ValueError("No se pudo leer el CSV.")
 
     return pd.read_excel(
-        io.BytesIO(data),
-        dtype=str
-    ).fillna("")
+        io.BytesIO(raw),
+        dtype=str,
+        keep_default_na=False
+    )
 
 
-@st.cache_data(ttl=900, show_spinner=False)
-def fetch_page(srn, page, page_size):
-    params = {
-        "page": page,
-        "pageSize": page_size,
-        "size": page_size,
-        "iso2Code": "en",
-        "languageIso2Code": "en",
-        "srn": srn
-    }
-
+@st.cache_data(ttl=1800, show_spinner=False)
+def lookup(srn, reference):
     retry = Retry(
         total=2,
         connect=2,
         read=2,
         status=2,
-        backoff_factor=1.5,
+        backoff_factor=1.0,
         status_forcelist=[
             429, 500, 502, 503, 504
         ],
@@ -96,38 +103,32 @@ def fetch_page(srn, page, page_size):
         )
 
         response = session.get(
-            BASE,
-            params=params,
-            timeout=(12, 60),
+            API,
+            params={
+                "api-version": "v1.0",
+                "format": "json",
+                "MF_SRN": srn,
+                "REFERENCE": reference
+            },
             headers={
                 "Accept": "application/json",
-                "User-Agent": "UDIConnectPilot/3.1"
-            }
+                "User-Agent": "UDIConnectPilot/4.0"
+            },
+            timeout=(12, 55)
         )
 
         response.raise_for_status()
-        payload = response.json()
+        data = response.json()
 
     if (
-        not isinstance(payload, dict)
-        or not isinstance(payload.get("content"), list)
+        not isinstance(data, dict)
+        or not isinstance(data.get("value"), list)
     ):
         raise ValueError(
-            "Respuesta EUDAMED no reconocida."
+            "La API devolvió un formato JSON inesperado."
         )
 
-    return payload
-
-
-with st.sidebar:
-    st.header("Fuente de datos")
-    st.markdown(
-        f"[Abrir EUDAMED oficial]({PUBLIC})"
-    )
-    st.caption(
-        "La disponibilidad del servicio "
-        "puede variar."
-    )
+    return data["value"]
 
 
 srn = st.text_input(
@@ -135,223 +136,154 @@ srn = st.text_input(
     value="ES-MF-000002991"
 ).strip().upper()
 
-file = st.file_uploader(
-    "Sube tu Excel con MANUFACT_ITEMNUM",
+upload = st.file_uploader(
+    "Excel o CSV con columna MANUFACT_ITEMNUM",
     type=["xlsx", "csv"]
 )
 
-page_size = st.selectbox(
-    "Registros por página",
-    [10, 20, 25, 50, 100],
-    index=1
-)
-
-max_pages = st.number_input(
-    "Máximo de páginas",
+limit = st.number_input(
+    "Máximo de referencias por ejecución",
     min_value=1,
-    max_value=10000,
-    value=10,
+    max_value=5000,
+    value=20,
     step=1
 )
 
 st.caption(
-    "Si la consulta queda incompleta, "
-    "las referencias sin coincidencia "
-    "permanecerán pendientes."
+    "Recomendamos empezar con 1 a 20 referencias. "
+    "Los lotes grandes pueden tardar."
 )
 
+frame = None
+column = None
 
-if file is not None:
+if upload is not None:
     try:
-        original = read_file(file)
+        frame = load_file(upload)
 
-        col = next(
+        column = next(
             (
-                c for c in original.columns
+                c for c in frame.columns
                 if str(c).strip().upper()
                 == "MANUFACT_ITEMNUM"
             ),
             None
         )
 
-        if col is None:
+        if column is None:
             st.error(
-                "El Excel debe contener la columna "
-                "MANUFACT_ITEMNUM."
+                "Falta la columna MANUFACT_ITEMNUM."
             )
-            st.stop()
+            frame = None
 
-        refs = original[col].astype(str).tolist()
+        else:
+            st.success(
+                f"Archivo leído: {len(frame)} filas."
+            )
 
-        st.success(
-            f"Archivo leído: {len(refs)} referencias."
-        )
-
-        st.dataframe(
-            pd.DataFrame({
-                "MANUFACT_ITEMNUM": refs
-            }).head(10),
-            hide_index=True
-        )
+            st.dataframe(
+                frame[[column]].head(8),
+                hide_index=True
+            )
 
     except Exception as exc:
         st.error(
-            f"No se pudo abrir el archivo: {exc}"
+            f"Error al abrir el archivo: {exc}"
         )
-        st.stop()
-
-else:
-    refs = None
+        frame = None
 
 
 if st.button(
     "Buscar UDI-DI en EUDAMED",
     type="primary",
-    disabled=(refs is None or not srn)
+    disabled=frame is None
 ):
     if not re.fullmatch(
         r"[A-Z]{2}-MF-\d+", srn
     ):
         st.error(
-            "Formato de SRN incorrecto."
+            "Introduce un SRN de fabricante válido."
         )
         st.stop()
 
-    progress = st.progress(
-        0,
-        text="Iniciando consulta..."
+    refs = frame[column].astype(str).tolist()
+    selected = refs[:int(limit)]
+
+    unique = list(
+        dict.fromkeys(
+            as_text(r)
+            for r in selected
+            if as_text(r)
+        )
     )
 
-    records = []
-    complete = False
-    error = None
-    pages_checked = 0
-    total_pages = None
+    findings = {}
+    progress = st.progress(0)
+    status = st.empty()
 
-    try:
-        for page in range(int(max_pages)):
-            payload = fetch_page(
-                srn,
-                page,
-                int(page_size)
-            )
-
-            chunk = payload["content"]
-
-            for item in chunk:
-                if not isinstance(item, dict):
-                    continue
-
-                record_srn = str(
-                    item.get("manufacturerSrn") or ""
-                ).strip().upper()
-
-                if record_srn == srn:
-                    records.append(item)
-
-            pages_checked += 1
-
-            if total_pages is None:
-                try:
-                    total_pages = int(
-                        payload["totalPages"]
-                    )
-                except (
-                    KeyError,
-                    ValueError,
-                    TypeError
-                ):
-                    total_pages = None
-
-            progress.progress(
-                min(
-                    (page + 1) / int(max_pages),
-                    1.0
-                ),
-                text=(
-                    f"Páginas consultadas: "
-                    f"{pages_checked}"
-                )
-            )
-
-            if (
-                payload.get("last") is True
-                or (
-                    total_pages is not None
-                    and page + 1 >= total_pages
-                )
-                or not chunk
-                or len(chunk) < int(page_size)
-            ):
-                complete = True
-                break
-
-    except requests.exceptions.Timeout:
-        error = (
-            "Tiempo de espera agotado "
-            "al contactar con EUDAMED."
+    for i, ref in enumerate(unique):
+        status.write(
+            f"Consultando {i + 1}/{len(unique)}: {ref}"
         )
 
-    except requests.exceptions.RequestException as exc:
-        error = f"Error de conexión: {exc}"
+        try:
+            raw = lookup(srn, ref)
 
-    except Exception as exc:
-        error = str(exc)
+            verified = [
+                r for r in raw
+                if isinstance(r, dict)
+                and norm(r.get("MF_SRN")) == norm(srn)
+                and norm(r.get("REFERENCE")) == norm(ref)
+            ]
+
+            if len(raw) >= 1000:
+                findings[ref] = (
+                    "Respuesta posiblemente truncada",
+                    []
+                )
+
+            elif not verified:
+                findings[ref] = (
+                    "Sin coincidencia exacta en API",
+                    []
+                )
+
+            else:
+                findings[ref] = (
+                    "Encontrado",
+                    verified
+                )
+
+        except requests.exceptions.RequestException as exc:
+            findings[ref] = (
+                f"Error de conexión: {exc}",
+                []
+            )
+
+        except Exception as exc:
+            findings[ref] = (
+                f"Error de respuesta: {exc}",
+                []
+            )
+
+        progress.progress(
+            (i + 1) / max(len(unique), 1)
+        )
+
+        if i < len(unique) - 1:
+            time.sleep(0.5)
 
     progress.empty()
+    status.empty()
 
-    if error:
-        st.error(
-            f"La consulta no se completó: {error}"
-        )
-        st.warning(
-            "Las referencias no localizadas "
-            "quedan pendientes de revisión."
-        )
+    output = []
 
-    elif not complete:
-        st.warning(
-            "Consulta parcial: se alcanzó "
-            "el límite de páginas."
-        )
+    for ref in selected:
+        ref = as_text(ref)
 
-    else:
-        st.success(
-            "Consulta de páginas completada."
-        )
-
-    st.write(
-        f"Registros recibidos: {len(records)} "
-        f"· Páginas: {pages_checked}"
-    )
-
-    if pages_checked > 0 and not records:
-        st.warning(
-            "No se pudieron confirmar registros "
-            "con el SRN indicado."
-        )
-        complete = False
-
-    lookup = {}
-
-    for item in records:
-        reference = norm(
-            item.get("reference")
-        )
-
-        if reference:
-            lookup.setdefault(
-                reference, []
-            ).append(item)
-
-    result_rows = []
-
-    for ref in refs:
-        key = norm(ref)
-
-        matches = (
-            lookup.get(key, [])
-            if key else []
+        state, matches = findings.get(
+            ref,
+            ("Referencia vacía", [])
         )
 
         row = {
@@ -360,129 +292,99 @@ if st.button(
             "UDI-DI": "",
             "Basic UDI-DI": "",
             "Master UDI-DI": "",
+            "Estado": state,
             "Fabricante EUDAMED": "",
-            "Referencia EUDAMED": "",
-            "Estado": "",
-            "Enlace EUDAMED": ""
+            "Referencia EUDAMED": ""
         }
 
-        if not key:
-            row["Estado"] = "Referencia vacía"
-
-        elif not matches:
-            if complete and not error:
-                row["Estado"] = (
-                    "Sin coincidencia en consulta completa"
-                )
-            else:
-                row["Estado"] = (
-                    "Pendiente: consulta incompleta"
-                )
-
-        else:
-            latest = [
-                x for x in matches
-                if x.get("latestVersion") is True
-            ]
-
-            candidates = latest or matches
-
-            distinct = {
+        if matches:
+            pairs = {
                 (
-                    str(x.get("primaryDi") or ""),
-                    str(x.get("uuid") or "")
+                    as_text(r.get("PRIMARY_DI")),
+                    as_text(r.get("BASIC_UDI"))
                 )
-                for x in candidates
+                for r in matches
             }
 
-            if len(distinct) != 1:
+            if len(pairs) > 1:
                 row["Estado"] = (
                     "Coincidencias múltiples: revisar"
                 )
 
             else:
-                item = candidates[0]
+                item = matches[0]
 
-                row["UDI-DI"] = str(
-                    item.get("primaryDi") or ""
+                row["UDI-DI"] = as_text(
+                    item.get("PRIMARY_DI")
                 )
 
-                row["Basic UDI-DI"] = str(
-                    item.get("basicUdi") or ""
+                row["Basic UDI-DI"] = as_text(
+                    item.get("BASIC_UDI")
                 )
 
-                row["Fabricante EUDAMED"] = str(
-                    item.get("manufacturerName") or ""
+                row["Fabricante EUDAMED"] = as_text(
+                    item.get("MF_NAME")
                 )
 
-                row["Referencia EUDAMED"] = str(
-                    item.get("reference") or ""
+                row["Referencia EUDAMED"] = as_text(
+                    item.get("REFERENCE")
                 )
-
-                uuid = str(
-                    item.get("uuid") or ""
-                )
-
-                if uuid:
-                    row["Enlace EUDAMED"] = (
-                        f"{PUBLIC}/{uuid}"
-                    )
 
                 if row["UDI-DI"]:
                     row["Estado"] = (
-                        "Coincidencia exacta "
-                        "por referencia y SRN"
+                        "Coincidencia exacta"
                     )
                 else:
                     row["Estado"] = (
-                        "Coincidencia sin UDI-DI: revisar"
+                        "Encontrado sin UDI-DI: revisar"
                     )
 
-        result_rows.append(row)
+        output.append(row)
 
-    result = pd.DataFrame(result_rows)
+    result = pd.DataFrame(output)
 
-    st.session_state["udi_results"] = result
-    st.session_state["udi_query"] = {
-        "srn": srn,
-        "complete": complete,
-        "error": error,
-        "pages": pages_checked,
-        "records": len(records)
+    st.session_state["result"] = result
+
+    st.session_state["metadata"] = {
+        "SRN": srn,
+        "Fecha UTC": datetime.now(
+            timezone.utc
+        ).isoformat(),
+        "Referencias procesadas": len(selected),
+        "Filas restantes": (
+            len(refs) - len(selected)
+        ),
+        "Fuente": API,
+        "Consulta": "MF_SRN + REFERENCE"
     }
 
 
-if "udi_results" in st.session_state:
-    result = st.session_state["udi_results"]
-
-    info = st.session_state.get(
-        "udi_query", {}
-    )
+if "result" in st.session_state:
+    result = st.session_state["result"]
 
     st.subheader("Resultados")
 
     a, b, c = st.columns(3)
 
     a.metric(
-        "Referencias",
+        "Consultadas",
         len(result)
     )
 
     b.metric(
-        "Encontradas",
+        "Coincidencias exactas",
         int(
             result["Estado"].eq(
-                "Coincidencia exacta por referencia y SRN"
+                "Coincidencia exacta"
             ).sum()
         )
     )
 
     c.metric(
-        "Pendientes o por revisar",
+        "Pendientes / revisar",
         int(
-            (
-                result["Estado"]
-                != "Coincidencia exacta por referencia y SRN"
+            result["Estado"].ne(
+                "Coincidencia exacta"
             ).sum()
         )
     )
@@ -504,20 +406,23 @@ if "udi_results" in st.session_state:
             index=False
         )
 
-        pd.DataFrame([info]).to_excel(
+        pd.DataFrame(
+            [st.session_state["metadata"]]
+        ).to_excel(
             writer,
-            sheet_name="Control de consulta",
+            sheet_name="Control",
             index=False
         )
 
-        sheet = writer.sheets["Resultados"]
-
-        for cells in sheet.columns:
-            for cell in cells[1:]:
-                cell.number_format = "@"
+        for sheet in writer.book.worksheets:
+            for excel_row in sheet.iter_rows(
+                min_row=2
+            ):
+                for cell in excel_row:
+                    cell.number_format = "@"
 
     st.download_button(
-        "Descargar Excel de resultados",
+        "Descargar Excel",
         data=out.getvalue(),
         file_name="UDI_Connect_resultados.xlsx",
         mime=(
@@ -528,9 +433,11 @@ if "udi_results" in st.session_state:
 
 
 st.divider()
+
 st.caption(
     "UDI Connect es una herramienta piloto "
-    "no afiliada a la Comisión Europea. "
-    "Verifica los datos en EUDAMED "
-    "antes de comunicarlos a AEMPS."
+    "independiente. La API de descarga puede "
+    "actualizarse con retraso respecto a la "
+    "interfaz pública de EUDAMED. Un resultado "
+    "vacío no demuestra que el producto no exista."
 )
