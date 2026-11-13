@@ -12,23 +12,22 @@ import streamlit as st
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
+
 st.set_page_config(
-    page_title="UDI Connect 6.1",
+    page_title="UDI Connect 6.2",
     page_icon="🔎",
     layout="wide"
 )
 
-st.title("🔎 UDI Connect 6.1")
-
+st.title("🔎 UDI Connect 6.2")
 st.caption(
-    "Hasta 5.000 referencias · "
-    "lotes de 10, 25, 50 o 100 · "
-    "recuperación mediante Excel"
+    "Hasta 5.000 referencias · SRN dinámicos · "
+    "Lotes de 10, 25, 50 o 100 · Recuperación mediante Excel"
 )
 
-API = (
-    "https://api.datalake.sante.service.ec.europa.eu"
-    "/eudamed/udi"
+API = st.secrets.get(
+    "EUDAMED_API_URL",
+    "https://api.datalake.sante.service.ec.europa.eu/eudamed/udi"
 )
 
 MAX_ROWS = 5000
@@ -46,19 +45,20 @@ COLUMNS = [
 ]
 
 
-def clean(v):
-    return re.sub(
-        r"\s+", "", str(v or "")
-    ).upper().replace(
-        "–", "-"
-    ).replace("—", "-")
+def clean(value):
+    return (
+        re.sub(r"\s+", "", str(value or ""))
+        .upper()
+        .replace("–", "-")
+        .replace("—", "-")
+    )
 
 
 def read_input(upload):
     raw = upload.getvalue()
 
     if upload.name.lower().endswith(".csv"):
-        for enc in ("utf-8-sig", "latin-1"):
+        for encoding in ("utf-8-sig", "latin-1"):
             try:
                 return pd.read_csv(
                     io.BytesIO(raw),
@@ -66,12 +66,9 @@ def read_input(upload):
                     keep_default_na=False,
                     sep=None,
                     engine="python",
-                    encoding=enc
+                    encoding=encoding
                 )
-            except (
-                UnicodeError,
-                pd.errors.ParserError
-            ):
+            except (UnicodeError, pd.errors.ParserError):
                 continue
 
         raise ValueError("No se pudo leer el CSV")
@@ -89,9 +86,7 @@ def request_session():
     retries = Retry(
         total=1,
         backoff_factor=0.5,
-        status_forcelist=[
-            429, 500, 502, 503, 504
-        ],
+        status_forcelist=[429, 500, 502, 503, 504],
         allowed_methods=["GET"]
     )
 
@@ -102,7 +97,7 @@ def request_session():
 
     session.headers.update({
         "Accept": "application/json",
-        "User-Agent": "UDIConnect/6.1"
+        "User-Agent": "UDIConnect/6.2"
     })
 
     return session
@@ -125,13 +120,10 @@ def query(session, srn, reference):
 
     if (
         not isinstance(payload, dict)
-        or not isinstance(
-            payload.get("value"), list
-        )
+        or not isinstance(payload.get("value"), list)
     ):
         raise ValueError(
-            "Respuesta inesperada: "
-            "falta la lista value"
+            "Respuesta inesperada: falta la lista value"
         )
 
     rows = payload["value"]
@@ -140,42 +132,42 @@ def query(session, srn, reference):
         return {
             "Estado": "Revisar: límite API",
             "Detalle": (
-                "La respuesta alcanza 1.000 "
-                "registros y podría estar truncada"
+                "La respuesta alcanza 1.000 registros "
+                "y podría estar truncada"
             )
         }
 
     matches = [
-        r for r in rows
-        if isinstance(r, dict)
-        and clean(r.get("MF_SRN")) == clean(srn)
-        and clean(r.get("REFERENCE")) == clean(reference)
+        row
+        for row in rows
+        if isinstance(row, dict)
+        and clean(row.get("MF_SRN")) == clean(srn)
+        and clean(row.get("REFERENCE")) == clean(reference)
     ]
 
     if not matches:
         return {
             "Estado": "Sin coincidencia en API",
             "Detalle": (
-                "No se encontró coincidencia "
-                "exacta en la descarga pública; "
-                "verificar EUDAMED"
+                "No se encontró coincidencia exacta. "
+                "Verificar en EUDAMED."
             )
         }
 
     variants = {
         (
-            str(r.get("PRIMARY_DI") or ""),
-            str(r.get("BASIC_UDI") or "")
+            str(row.get("PRIMARY_DI") or ""),
+            str(row.get("BASIC_UDI") or "")
         )
-        for r in matches
+        for row in matches
     }
 
     if len(variants) != 1:
         return {
             "Estado": "Revisar: múltiples UDI",
             "Detalle": (
-                f"{len(variants)} combinaciones "
-                "diferentes; revisar manualmente"
+                f"{len(variants)} combinaciones diferentes. "
+                "Revisar manualmente."
             )
         }
 
@@ -184,9 +176,7 @@ def query(session, srn, reference):
     if not primary:
         return {
             "Estado": "Revisar: sin UDI-DI",
-            "Detalle": (
-                "Coincidencia sin PRIMARY_DI"
-            )
+            "Detalle": "Coincidencia sin PRIMARY_DI"
         }
 
     return {
@@ -197,19 +187,20 @@ def query(session, srn, reference):
             matches[0].get("MF_NAME") or ""
         ),
         "Detalle": (
-            "Coincidencia exacta de SRN "
-            "y referencia (Data Lake)"
+            "Coincidencia exacta de SRN y referencia"
         )
     }
 
 
-def digest(srn, refs):
+def digest(srns, refs):
     data = json.dumps(
-        [srn, refs],
+        [srns, refs],
         ensure_ascii=False
-    ).encode("utf-8")
+    )
 
-    return hashlib.sha256(data).hexdigest()
+    return hashlib.sha256(
+        data.encode()
+    ).hexdigest()
 
 
 def export_xlsx(df, srn, signature):
@@ -250,20 +241,27 @@ def export_xlsx(df, srn, signature):
     return output.getvalue()
 
 
+# ========================================
+# ENTRADA DE DATOS
+# ========================================
+
 srn = st.text_input(
-    "SRN del fabricante",
-    placeholder="ES-MF-000002991"
+    "SRN predeterminado",
+    placeholder="ES-MF-000002991",
+    help=(
+        "Opcional si el Excel contiene "
+        "una columna SRN para cada referencia."
+    )
 ).strip().upper()
 
 upload = st.file_uploader(
-    "Archivo Excel o CSV "
-    "(columna MANUFACT_ITEMNUM)",
-    type=["xlsx", "csv"]
+    "Archivo Excel o CSV",
+    type=["xlsx", "csv"],
+    help="Debe incluir MANUFACT_ITEMNUM"
 )
 
 checkpoint = st.file_uploader(
-    "Recuperar Excel de progreso "
-    "anterior (opcional)",
+    "Recuperar progreso anterior (opcional)",
     type=["xlsx"],
     key="progress_upload"
 )
@@ -274,34 +272,18 @@ size = st.selectbox(
     index=1
 )
 
-
 if not upload:
     st.info(
-        "Introduce un SRN y adjunta "
-        "el Excel de referencias."
+        "Introduce un SRN y adjunta el Excel, "
+        "o utiliza un Excel con columnas "
+        "SRN y MANUFACT_ITEMNUM."
     )
     st.stop()
 
 
-if not re.fullmatch(
-    r"[A-Z]{2}-(MF|PR)-\d{9}", srn
-):
-    st.error(
-        "El SRN debe tener un formato como "
-        "ES-MF-000002991 o ES-PR-000042695."
-    )
-    st.stop()
-
-
-if "-PR-" in srn:
-    st.warning(
-        "SRN PR reconocido. El filtro MF_SRN "
-        "de esta API corresponde a fabricantes "
-        "MF; no se realizará una búsqueda PR "
-        "no verificada."
-    )
-    st.stop()
-
+# ========================================
+# VALIDACIÓN DEL EXCEL
+# ========================================
 
 try:
     source = read_input(upload)
@@ -323,15 +305,53 @@ try:
 
     if not 1 <= len(source) <= MAX_ROWS:
         st.error(
-            "El archivo debe contener "
-            "entre 1 y 5.000 filas."
+            "El archivo debe contener entre "
+            "1 y 5.000 filas."
         )
         st.stop()
 
     refs = [
-        str(x).strip()
-        for x in source[col].tolist()
+        str(value).strip()
+        for value in source[col].tolist()
     ]
+
+    srn_col = next(
+        (
+            c for c in source.columns
+            if str(c).strip().upper() == "SRN"
+        ),
+        None
+    )
+
+    if srn_col:
+        srns = [
+            str(value).strip().upper() or srn
+            for value in source[srn_col].tolist()
+        ]
+    else:
+        srns = [srn] * len(refs)
+
+    invalid = [
+        i + 2
+        for i, value in enumerate(srns)
+        if not re.fullmatch(
+            r"[A-Z]{2}-(MF|PR)-\d{9}",
+            value
+        )
+    ]
+
+    if invalid:
+        raise ValueError(
+            "SRN no válido o vacío en las "
+            f"filas: {invalid[:12]}"
+        )
+
+    if any("-PR-" in value for value in srns):
+        st.warning(
+            "El archivo contiene SRN de tipo PR. "
+            "Se conservarán en los resultados, "
+            "pero no se consultarán mediante MF_SRN."
+        )
 
 except Exception as exc:
     st.error(
@@ -340,12 +360,13 @@ except Exception as exc:
     st.stop()
 
 
-signature = digest(srn, refs)
+# ========================================
+# ESTADO Y RECUPERACIÓN
+# ========================================
 
+signature = digest(srns, refs)
 
-if st.session_state.get(
-    "signature"
-) != signature:
+if st.session_state.get("signature") != signature:
 
     st.session_state.signature = signature
 
@@ -353,7 +374,7 @@ if st.session_state.get(
         [
             {
                 "MANUFACT_ITEMNUM": ref,
-                "SRN": srn,
+                "SRN": srns[i],
                 "UDI-DI": "",
                 "Basic UDI-DI": "",
                 "Master UDI-DI": "",
@@ -362,7 +383,7 @@ if st.session_state.get(
                 "Detalle": "",
                 "Fecha consulta UTC": ""
             }
-            for ref in refs
+            for i, ref in enumerate(refs)
         ],
         columns=COLUMNS
     )
@@ -372,29 +393,25 @@ if st.session_state.get(
 
 
 if checkpoint:
+
     checkpoint_hash = hashlib.sha256(
         checkpoint.getvalue()
     ).hexdigest()
 
     if (
-        st.session_state.get(
-            "loaded_checkpoint"
-        ) != checkpoint_hash
+        st.session_state.get("loaded_checkpoint")
+        != checkpoint_hash
     ):
         try:
             old = pd.read_excel(
-                io.BytesIO(
-                    checkpoint.getvalue()
-                ),
+                io.BytesIO(checkpoint.getvalue()),
                 sheet_name="Resultados",
                 dtype=str,
                 keep_default_na=False
             )
 
             meta = pd.read_excel(
-                io.BytesIO(
-                    checkpoint.getvalue()
-                ),
+                io.BytesIO(checkpoint.getvalue()),
                 sheet_name="Control",
                 dtype=str,
                 keep_default_na=False
@@ -410,7 +427,7 @@ if checkpoint:
             ):
                 raise ValueError(
                     "El progreso no corresponde "
-                    "a este SRN y archivo"
+                    "a este archivo."
                 )
 
             if (
@@ -420,15 +437,16 @@ if checkpoint:
                 or old[
                     "MANUFACT_ITEMNUM"
                 ].tolist() != refs
+                or old["SRN"].tolist() != srns
             ):
                 raise ValueError(
                     "El archivo de progreso "
-                    "no coincide con las referencias"
+                    "no coincide con las referencias."
                 )
 
-            st.session_state.results = old[
-                COLUMNS
-            ].copy()
+            st.session_state.results = (
+                old[COLUMNS].copy()
+            )
 
             st.session_state.loaded_checkpoint = (
                 checkpoint_hash
@@ -440,10 +458,13 @@ if checkpoint:
 
         except Exception as exc:
             st.error(
-                "No se pudo restaurar el "
-                f"progreso: {exc}"
+                f"No se pudo restaurar: {exc}"
             )
 
+
+# ========================================
+# INDICADORES
+# ========================================
 
 results = st.session_state.results
 
@@ -464,22 +485,33 @@ c3.metric("UDI-DI encontrados", found)
 st.progress(completed / len(results))
 
 
-st.markdown(
-    "### 1. Comprobar la conexión"
-)
+# ========================================
+# PRUEBA DE CONEXIÓN
+# ========================================
+
+st.markdown("### 1. Comprobar conexión")
 
 if st.button(
-    "Probar API con la primera "
-    "referencia no vacía"
+    "Probar API con la primera referencia"
 ):
-    test_ref = next(
-        (x for x in refs if x),
+
+    test_idx = next(
+        (
+            i for i, ref in enumerate(refs)
+            if ref and "-MF-" in srns[i]
+        ),
         None
+    )
+
+    test_ref = (
+        refs[test_idx]
+        if test_idx is not None
+        else None
     )
 
     if not test_ref:
         st.error(
-            "No hay referencias para probar."
+            "No hay referencias MF para probar."
         )
 
     else:
@@ -487,33 +519,35 @@ if st.button(
             with request_session() as session:
                 test_result = query(
                     session,
-                    srn,
+                    srns[test_idx],
                     test_ref
                 )
 
             st.session_state.api_checked = True
 
             st.success(
-                "El servicio respondió con el "
-                "formato esperado. "
-                "Puedes procesar lotes."
+                "La API respondió con el "
+                "formato esperado."
             )
 
             st.write({
+                "SRN": srns[test_idx],
                 "Referencia": test_ref,
                 **test_result
             })
 
         except requests.HTTPError as exc:
+
             st.session_state.api_checked = False
 
             st.error(
                 f"Error HTTP: {exc}. "
-                "No ejecutes lotes hasta resolver "
-                "el acceso a la API."
+                "La conexión no está validada. "
+                "No ejecutes lotes."
             )
 
         except Exception as exc:
+
             st.session_state.api_checked = False
 
             st.error(
@@ -521,24 +555,25 @@ if st.button(
             )
 
 
-st.markdown(
-    "### 2. Procesar y descargar"
-)
+# ========================================
+# PROCESAMIENTO POR LOTES
+# ========================================
+
+st.markdown("### 2. Procesar referencias")
 
 pending = results.index[
     results["Estado"] == "Pendiente"
 ].tolist()
 
-
 if st.button(
-    f"Procesar siguiente lote "
-    f"(máximo {size})",
+    f"Procesar siguiente lote (máximo {size})",
     type="primary",
     disabled=(
         not pending
         or not st.session_state.api_checked
     )
 ):
+
     indexes = pending[:size]
 
     progress = st.progress(0)
@@ -548,17 +583,18 @@ if st.button(
     fatal_error = None
 
     with request_session() as session:
-        for count, idx in enumerate(
-            indexes, 1
-        ):
+
+        for count, idx in enumerate(indexes, 1):
+
             ref = refs[idx]
 
             label.caption(
-                f"Consulta {count}/"
-                f"{len(indexes)}: {ref}"
+                f"Consulta {count}/{len(indexes)}: "
+                f"{ref}"
             )
 
             if not ref:
+
                 item = {
                     "Estado": "Referencia vacía",
                     "Detalle": (
@@ -566,27 +602,50 @@ if st.button(
                     )
                 }
 
-            elif clean(ref) in cache:
-                item = cache[clean(ref)]
+            elif "-PR-" in srns[idx]:
+
+                item = {
+                    "Estado": (
+                        "PR: consulta no implementada"
+                    ),
+                    "Detalle": (
+                        "No utilizar MF_SRN "
+                        "para un productor PR"
+                    )
+                }
+
+            elif (
+                srns[idx],
+                clean(ref)
+            ) in cache:
+
+                item = cache[
+                    (srns[idx], clean(ref))
+                ]
 
             else:
+
                 try:
                     item = query(
                         session,
-                        srn,
+                        srns[idx],
                         ref
                     )
 
-                    cache[clean(ref)] = item
+                    cache[
+                        (srns[idx], clean(ref))
+                    ] = item
 
                 except requests.HTTPError as exc:
+
                     if (
                         exc.response is not None
                         and exc.response.status_code
                         in (400, 401, 403, 404)
                     ):
+
                         fatal_error = (
-                            "Error HTTP "
+                            f"Error HTTP "
                             f"{exc.response.status_code}: "
                             f"{exc}"
                         )
@@ -594,6 +653,7 @@ if st.button(
                         st.session_state.api_checked = (
                             False
                         )
+
                         break
 
                     item = {
@@ -602,6 +662,7 @@ if st.button(
                     }
 
                 except Exception as exc:
+
                     item = {
                         "Estado": "Error temporal",
                         "Detalle": str(exc)[:250]
@@ -611,7 +672,8 @@ if st.button(
                 results.at[idx, field] = value
 
             results.at[
-                idx, "Fecha consulta UTC"
+                idx,
+                "Fecha consulta UTC"
             ] = datetime.now(
                 timezone.utc
             ).isoformat()
@@ -629,16 +691,20 @@ if st.button(
     if fatal_error:
         st.error(
             "Proceso detenido para evitar "
-            "errores repetidos. "
-            f"{fatal_error}"
+            f"errores repetidos. {fatal_error}"
         )
-
     else:
         st.success(
-            "Lote finalizado. Descarga "
-            "el progreso antes de continuar."
+            "Lote finalizado. "
+            "Descarga el progreso."
         )
 
+
+# ========================================
+# RESULTADOS Y DESCARGA
+# ========================================
+
+st.markdown("### 3. Resultados")
 
 st.dataframe(
     st.session_state.results,
@@ -653,21 +719,26 @@ st.download_button(
         srn,
         signature
     ),
-    file_name=(
-        f"UDI_Connect_{srn}_progreso.xlsx"
-    ),
+    file_name="UDI_Connect_progreso.xlsx",
     mime=(
         "application/vnd.openxmlformats-officedocument."
         "spreadsheetml.sheet"
     )
 )
 
+st.warning(
+    "La dirección predeterminada de la API "
+    "todavía no está validada. "
+    "Anteriormente devolvió HTTP 404. "
+    "No proceses lotes hasta superar "
+    "la prueba de conexión."
+)
+
 st.caption(
-    "El Excel es el mecanismo de recuperación "
-    "después de un reinicio. "
-    "No hay guardado automático en servidor. "
-    "Master UDI-DI permanece vacío si la fuente "
-    "no lo proporciona. "
-    "Verifica los datos en EUDAMED antes "
-    "de usarlos en RECOPS."
+    "La recuperación utiliza el Excel descargado. "
+    "No existe guardado automático en servidor. "
+    "Master UDI-DI permanecerá vacío cuando "
+    "la fuente no proporcione ese dato. "
+    "Verifica los resultados en EUDAMED "
+    "antes de utilizarlos en RECOPS."
 )
