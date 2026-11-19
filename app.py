@@ -2,156 +2,103 @@
 import io
 import re
 import time
+import hashlib
 from datetime import datetime, timezone
-from urllib.parse import urlencode
 
 import pandas as pd
 import requests
 import streamlit as st
 
 st.set_page_config(
-    page_title="UDI Connect | Automático",
+    page_title="UDI Connect",
     page_icon="🔎",
     layout="wide"
 )
 
-st.title("🔎 UDI Connect — búsqueda automática de UDI-DI")
+st.title("🔎 UDI Connect — búsqueda automática")
 
 st.caption(
-    "Consulta EUDAMED por SRN y referencia del fabricante."
+    "Carga tu Excel, consulta fabricantes por SRN "
+    "y descarga las coincidencias verificadas."
 )
 
-API = "https://api.datalake.sante.service.ec.europa.eu/eudamed/udi"
+API = "https://ec.europa.eu/tools/eudamed/api/devices/udiDiData"
 
-DEFAULT_SRNS = """KR-MF-000026311
+SRN_RE = re.compile(r"^[A-Z]{2}-MF-\d{9}$")
+
+DEFAULT = """KR-MF-000026311
 CN-MF-000009139
 JP-MF-000011271"""
 
-COLUMNS = [
+COLS = [
     "MANUFACT_ITEMNUM",
     "SRN",
     "UDI-DI",
     "Basic UDI-DI",
     "Fabricante",
-    "Nombre producto",
+    "Nombre comercial",
     "Estado",
-    "Fuente",
-    "Fecha consulta UTC",
-    "Enlace EUDAMED"
+    "UUID",
+    "Fecha UTC"
 ]
 
-SRN_RE = re.compile(r"^[A-Z]{2}-(?:MF|PR)-\d{9}$")
+
+def norm(x):
+    return str(
+        x if x is not None else ""
+    ).strip().casefold()
 
 
-def official_url(srn, ref):
-    return (
-        "https://ec.europa.eu/tools/eudamed/"
-        "#/screen/search-device?"
-        + urlencode({
-            "srn": srn,
-            "reference": ref,
-            "submitted": "true"
-        })
-    )
-
-
-def get_records(srn, ref, timeout=22):
+def fetch(session, srn, page=0, page_size=300):
     params = {
-        "api-version": "v1.0",
-        "format": "json",
-        "MF_SRN": srn,
-        "REFERENCE": ref
+        "page": page,
+        "pageSize": page_size,
+        "size": page_size,
+        "iso2Code": "en",
+        "languageIso2Code": "en",
+        "srn": srn
     }
 
-    response = requests.get(
+    response = session.get(
         API,
         params=params,
-        timeout=timeout,
+        timeout=40,
+        allow_redirects=False,
         headers={
             "Accept": "application/json",
-            "User-Agent": "UDI-Connect/1.0"
+            "User-Agent": "UDIConnect/2.0"
         }
     )
 
+    if response.status_code in (
+        301, 302, 303, 307, 308
+    ):
+        raise RuntimeError(
+            "EUDAMED ha redirigido la consulta."
+        )
+
+    if response.status_code == 429:
+        raise RuntimeError(
+            "EUDAMED limita las consultas (429). "
+            "Espera unos minutos."
+        )
+
     response.raise_for_status()
-    data = response.json()
+
+    obj = response.json()
 
     if (
-        not isinstance(data, dict)
-        or not isinstance(data.get("value"), list)
+        not isinstance(obj, dict)
+        or not isinstance(obj.get("content"), list)
     ):
-        raise ValueError(
-            "Respuesta JSON inesperada de EUDAMED."
+        raise RuntimeError(
+            "Formato inesperado: falta content[]."
         )
 
-    return data["value"]
+    return obj
 
 
-def normalize(value):
-    return str(value or "").strip().casefold()
-
-
-def match_records(rows, srn, ref):
-    return [
-        r for r in rows
-        if (
-            isinstance(r, dict)
-            and normalize(r.get("MF_SRN")) == normalize(srn)
-            and normalize(r.get("REFERENCE")) == normalize(ref)
-        )
-    ]
-
-
-def make_rows(srn, ref, found, now):
-    base = {
-        "MANUFACT_ITEMNUM": ref,
-        "SRN": srn,
-        "Fecha consulta UTC": now,
-        "Enlace EUDAMED": official_url(srn, ref)
-    }
-
-    if not found:
-        return [{
-            **base,
-            "UDI-DI": "",
-            "Basic UDI-DI": "",
-            "Fabricante": "",
-            "Nombre producto": "",
-            "Estado": "Sin coincidencia en API",
-            "Fuente": "EUDAMED Data Lake"
-        }]
-
-    result = []
-
-    for r in found:
-        di = str(r.get("PRIMARY_DI") or "").strip()
-
-        result.append({
-            **base,
-            "UDI-DI": di,
-            "Basic UDI-DI": str(
-                r.get("BASIC_UDI") or ""
-            ).strip(),
-            "Fabricante": str(
-                r.get("MF_NAME") or ""
-            ).strip(),
-            "Nombre producto": str(
-                r.get("DEVICE_NAME")
-                or r.get("TRADE_NAME")
-                or ""
-            ).strip(),
-            "Estado": (
-                "Coincidencia exacta"
-                if di
-                else "Coincidencia sin UDI-DI"
-            ),
-            "Fuente": "EUDAMED Data Lake"
-        })
-
-    return result
-
-
-def read_file(upload):
+def read_refs(upload):
     raw = io.BytesIO(upload.getvalue())
 
     if upload.name.lower().endswith(".csv"):
@@ -176,21 +123,20 @@ def read_file(upload):
 
     if "MANUFACT_ITEMNUM" not in df.columns:
         raise ValueError(
-            "El archivo debe contener "
-            "la columna MANUFACT_ITEMNUM."
+            "Falta la columna MANUFACT_ITEMNUM."
         )
 
     return df
 
 
-def download_xlsx(df):
-    buffer = io.BytesIO()
+def xlsx(data):
+    out = io.BytesIO()
 
     with pd.ExcelWriter(
-        buffer,
+        out,
         engine="openpyxl"
     ) as writer:
-        df.to_excel(
+        data.to_excel(
             writer,
             index=False,
             sheet_name="Resultados UDI"
@@ -200,154 +146,152 @@ def download_xlsx(df):
         ws.freeze_panes = "A2"
         ws.auto_filter.ref = ws.dimensions
 
-        widths = {
-            "A": 22,
-            "B": 22,
-            "C": 25,
-            "D": 27,
-            "E": 35,
-            "F": 35,
-            "G": 45,
-            "H": 24,
-            "I": 24,
-            "J": 75
-        }
+        for col in ws.columns:
+            letter = col[0].column_letter
 
-        for col, width in widths.items():
-            ws.column_dimensions[col].width = width
+            width = max(
+                len(str(cell.value or ""))
+                for cell in col[:300]
+            ) + 2
 
-        for row in ws.iter_rows(min_row=2):
-            for cell in row:
+            ws.column_dimensions[letter].width = min(
+                48,
+                max(18, width)
+            )
+
+            for cell in col[1:]:
                 cell.number_format = "@"
 
-    return buffer.getvalue()
+    return out.getvalue()
 
 
-# COMPROBAR CONEXIÓN
+# PRUEBA DE CONEXIÓN
 
 with st.expander(
-    "Comprobar conexión con EUDAMED"
+    "Prueba de conexión",
+    expanded=True
 ):
     test_srn = st.text_input(
-        "SRN de prueba",
+        "SRN para la prueba",
         "LI-MF-000000522"
     )
 
-    test_ref = st.text_input(
-        "Referencia de prueba",
-        "577275WW"
-    )
-
-    if st.button("Probar API oficial"):
+    if st.button(
+        "Comprobar respuesta de EUDAMED"
+    ):
         try:
-            data = get_records(
-                test_srn.strip().upper(),
-                test_ref.strip()
-            )
-
-            matches = match_records(
-                data,
-                test_srn.strip().upper(),
-                test_ref.strip()
-            )
-
-            if matches:
-                st.success(
-                    f"Conexión operativa: "
-                    f"{len(matches)} coincidencias."
+            with requests.Session() as session:
+                obj = fetch(
+                    session,
+                    test_srn.strip().upper(),
+                    0,
+                    25
                 )
 
-                st.dataframe(
-                    pd.DataFrame(
-                        make_rows(
-                            test_srn.strip().upper(),
-                            test_ref.strip(),
-                            matches,
-                            datetime.now(
-                                timezone.utc
-                            ).isoformat()
-                        )
-                    )
+            total = int(
+                obj.get("totalElements", 0)
+            )
+
+            matches = sum(
+                norm(x.get("manufacturerSrn"))
+                == norm(test_srn)
+                for x in obj["content"]
+            )
+
+            st.write(
+                f"Respuesta HTTP correcta. "
+                f"Registros declarados: {total:,}. "
+                f"Coincidencias de SRN: "
+                f"{matches}/{len(obj['content'])}."
+            )
+
+            if (
+                total > 100000
+                or (
+                    obj["content"]
+                    and matches == 0
+                )
+            ):
+                st.error(
+                    "El filtro SRN parece ignorado "
+                    "o no está verificado. "
+                    "No ejecutes la búsqueda masiva."
                 )
             else:
-                st.warning(
-                    "La API respondió, pero no "
-                    "encontró coincidencias exactas."
+                st.success(
+                    "Respuesta compatible con "
+                    "una búsqueda acotada. "
+                    "Verifica los resultados."
                 )
 
         except Exception as exc:
             st.error(
-                f"Error de conexión: "
+                "No se pudo validar la conexión: "
                 f"{type(exc).__name__}: {exc}"
             )
 
 
-# CARGAR EXCEL
+# CARGA DEL EXCEL
 
 st.subheader("1. Cargar referencias")
 
-upload = st.file_uploader(
-    "Excel o CSV con MANUFACT_ITEMNUM",
-    type=["xlsx", "csv"]
-)
-
-srns_text = st.text_area(
-    "SRN de los fabricantes",
-    DEFAULT_SRNS,
+srn_text = st.text_area(
+    "SRN de fabricantes",
+    DEFAULT,
     height=105
 )
 
 srns = list(dict.fromkeys(
-    v.strip().upper()
-    for v in re.split(r"[,;\s]+", srns_text)
-    if v.strip()
+    value.strip().upper()
+    for value in re.split(
+        r"[,;\s]+",
+        srn_text
+    )
+    if value.strip()
 ))
 
 invalid = [
-    s for s in srns
-    if not SRN_RE.fullmatch(s)
+    srn for srn in srns
+    if not SRN_RE.fullmatch(srn)
 ]
 
 if invalid:
     st.error(
-        "SRN incorrectos: " + ", ".join(invalid)
+        "SRN inválidos: "
+        + ", ".join(invalid)
     )
+
+upload = st.file_uploader(
+    "Subir Excel/CSV con MANUFACT_ITEMNUM",
+    type=["xlsx", "csv"]
+)
 
 pairs = []
 
 if upload is not None:
     try:
-        source = read_file(upload)
+        source = read_refs(upload)
 
-        if "SRN" in source.columns:
-            for _, row in source.iterrows():
-                ref = str(
-                    row["MANUFACT_ITEMNUM"]
-                ).strip()
+        for _, row in source.iterrows():
+            ref = str(
+                row["MANUFACT_ITEMNUM"]
+            ).strip()
 
-                assigned = str(
-                    row["SRN"]
-                ).strip().upper()
+            if not ref:
+                continue
 
-                if ref:
-                    if assigned:
-                        pairs.append((ref, assigned))
-                    else:
-                        pairs.extend(
-                            (ref, s) for s in srns
-                        )
-        else:
-            refs = list(dict.fromkeys(
-                str(v).strip()
-                for v in source["MANUFACT_ITEMNUM"]
-                if str(v).strip()
-            ))
+            row_srn = str(
+                row.get("SRN", "")
+            ).strip().upper()
 
-            pairs = [
-                (ref, s)
-                for ref in refs
-                for s in srns
-            ]
+            assigned_srns = (
+                [row_srn]
+                if row_srn
+                else srns
+            )
+
+            for srn in assigned_srns:
+                pairs.append((ref, srn))
 
         pairs = list(dict.fromkeys(pairs))
 
@@ -357,146 +301,287 @@ if upload is not None:
             )
 
         st.info(
-            f"{len(pairs)} búsquedas preparadas."
+            f"{len(pairs)} combinaciones únicas "
+            "de referencia y SRN."
         )
 
     except Exception as exc:
-        st.error(f"Error leyendo Excel: {exc}")
+        st.error(
+            f"Error al leer el Excel: {exc}"
+        )
+
         pairs = []
 
 
-# PROCESAMIENTO AUTOMÁTICO
+# PREPARAR SESIÓN
 
-st.subheader("2. Ejecutar búsqueda automática")
+signature = hashlib.sha256(
+    repr(pairs).encode()
+).hexdigest()
 
-if "results" not in st.session_state:
+if st.session_state.get("signature") != signature:
+    st.session_state.signature = signature
     st.session_state.results = []
-    st.session_state.done = set()
-    st.session_state.batch_signature = None
+    st.session_state.finished_srns = set()
+    st.session_state.errors = {}
 
-signature = (
-    upload.getvalue().__hash__()
-    if upload else None,
-    tuple(pairs)
+max_pages = st.number_input(
+    "Límite de páginas por fabricante",
+    min_value=1,
+    max_value=100,
+    value=20
 )
 
-if st.session_state.batch_signature != signature:
-    st.session_state.results = []
-    st.session_state.done = set()
-    st.session_state.batch_signature = signature
-
-batch_size = st.slider(
-    "Consultas por lote",
-    1, 100, 30
+st.caption(
+    "Si se alcanza el límite, las referencias "
+    "no encontradas quedarán como incompletas."
 )
 
-delay = st.slider(
-    "Pausa entre consultas (segundos)",
-    0.5, 3.0, 0.7, 0.1
-)
 
-remaining = [
-    p for p in pairs
-    if p not in st.session_state.done
-]
+# BÚSQUEDA AUTOMÁTICA
 
-st.write(
-    f"Procesadas: {len(st.session_state.done)} "
-    f"· Pendientes: {len(remaining)}"
-)
+st.subheader("2. Buscar UDI-DI")
 
 if st.button(
-    "▶ Iniciar / continuar búsqueda",
+    "▶ Buscar UDI automáticamente",
     type="primary",
     disabled=not pairs or bool(invalid)
 ):
-    selected = remaining[:batch_size]
+    lookup = {}
+
+    for ref, srn in pairs:
+        lookup.setdefault(
+            srn,
+            set()
+        ).add(norm(ref))
+
+    pending = [
+        srn
+        for srn in lookup
+        if srn not in st.session_state.finished_srns
+    ]
 
     progress = st.progress(0)
-    status = st.empty()
 
-    for i, (ref, srn) in enumerate(selected):
-        status.write(
-            f"Consultando {i+1}/{len(selected)}: "
-            f"{srn} · {ref}"
-        )
+    with requests.Session() as session:
+        for index, srn in enumerate(pending):
+            st.write(
+                f"Consultando fabricante {srn}..."
+            )
 
-        try:
-            response = get_records(srn, ref)
+            found = {}
+            completed = False
+            error = None
 
-            if len(response) >= 1000:
-                raise ValueError(
-                    "Posible truncamiento de resultados."
+            try:
+                first = fetch(
+                    session,
+                    srn,
+                    0
                 )
 
-            exact = match_records(
-                response, srn, ref
-            )
+                total = int(
+                    first.get("totalElements", 0)
+                )
+
+                if total > 100000:
+                    raise RuntimeError(
+                        "El filtro SRN no es fiable: "
+                        f"la API devuelve {total:,} "
+                        "dispositivos."
+                    )
+
+                total_pages = int(
+                    first.get("totalPages", 1)
+                )
+
+                pages = min(
+                    total_pages,
+                    int(max_pages)
+                )
+
+                for page in range(pages):
+                    obj = (
+                        first
+                        if page == 0
+                        else fetch(
+                            session,
+                            srn,
+                            page
+                        )
+                    )
+
+                    content = obj["content"]
+
+                    if (
+                        content
+                        and all(
+                            norm(
+                                item.get(
+                                    "manufacturerSrn"
+                                )
+                            ) != norm(srn)
+                            for item in content
+                        )
+                    ):
+                        raise RuntimeError(
+                            "El servidor no está "
+                            "aplicando el filtro SRN."
+                        )
+
+                    for item in content:
+                        if (
+                            norm(
+                                item.get(
+                                    "manufacturerSrn"
+                                )
+                            ) != norm(srn)
+                        ):
+                            continue
+
+                        ref = norm(
+                            item.get("reference")
+                        )
+
+                        if ref in lookup[srn]:
+                            found.setdefault(
+                                ref,
+                                []
+                            ).append(item)
+
+                    if page < pages - 1:
+                        time.sleep(1.1)
+
+                completed = (
+                    pages >= total_pages
+                )
+
+            except Exception as exc:
+                error = (
+                    f"{type(exc).__name__}: "
+                    f"{exc}"
+                )
+
+            if error:
+                st.session_state.errors[srn] = error
+
+                st.error(
+                    f"{srn}: {error}"
+                )
+
+                break
 
             now = datetime.now(
                 timezone.utc
-            ).isoformat(timespec="seconds")
+            ).isoformat(
+                timespec="seconds"
+            )
 
-            st.session_state.results.extend(
-                make_rows(
-                    srn, ref, exact, now
+            for ref, assigned_srn in pairs:
+                if assigned_srn != srn:
+                    continue
+
+                hits = found.get(
+                    norm(ref),
+                    []
                 )
+
+                if hits:
+                    for item in hits:
+                        st.session_state.results.append({
+                            "MANUFACT_ITEMNUM": ref,
+                            "SRN": srn,
+                            "UDI-DI": str(
+                                item.get("primaryDi")
+                                or ""
+                            ),
+                            "Basic UDI-DI": str(
+                                item.get("basicUdi")
+                                or ""
+                            ),
+                            "Fabricante": str(
+                                item.get(
+                                    "manufacturerName"
+                                ) or ""
+                            ),
+                            "Nombre comercial": str(
+                                item.get("tradeName")
+                                or ""
+                            ),
+                            "Estado":
+                                "Coincidencia exacta "
+                                "SRN + referencia",
+                            "UUID": str(
+                                item.get("uuid")
+                                or ""
+                            ),
+                            "Fecha UTC": now
+                        })
+                else:
+                    st.session_state.results.append({
+                        "MANUFACT_ITEMNUM": ref,
+                        "SRN": srn,
+                        "UDI-DI": "",
+                        "Basic UDI-DI": "",
+                        "Fabricante": "",
+                        "Nombre comercial": "",
+                        "Estado": (
+                            "Sin coincidencia"
+                            if completed
+                            else "Búsqueda incompleta"
+                        ),
+                        "UUID": "",
+                        "Fecha UTC": now
+                    })
+
+            st.session_state.finished_srns.add(
+                srn
             )
 
-            st.session_state.done.add(
-                (ref, srn)
+            progress.progress(
+                (index + 1)
+                / max(1, len(pending))
             )
 
-        except Exception as exc:
-            st.error(
-                "Consulta detenida: "
-                f"{type(exc).__name__}: {exc}"
-            )
-            break
-
-        progress.progress(
-            (i + 1) / len(selected)
-        )
-
-        if i < len(selected) - 1:
-            time.sleep(delay)
-
-    st.info(
-        f"Consultas completadas: "
-        f"{len(st.session_state.done)} "
-        f"de {len(pairs)}."
+    st.success(
+        "Fabricantes procesados: "
+        f"{len(st.session_state.finished_srns)}"
+        f"/{len(lookup)}"
     )
 
 
-# RESULTADOS Y DESCARGA
+# DESCARGAR RESULTADOS
+
+st.subheader("3. Resultados")
 
 if st.session_state.results:
     results = pd.DataFrame(
         st.session_state.results,
-        columns=COLUMNS
+        columns=COLS
     )
 
-    st.subheader("3. Resultados y descarga")
+    found_count = int(
+        (
+            results["Estado"]
+            == "Coincidencia exacta "
+               "SRN + referencia"
+        ).sum()
+    )
 
     st.metric(
-        "UDI-DI encontrados",
-        int(
-            (
-                results["Estado"]
-                == "Coincidencia exacta"
-            ).sum()
-        )
+        "Coincidencias verificadas",
+        found_count
     )
 
     st.dataframe(
         results,
-        hide_index=True,
-        use_container_width=True
+        use_container_width=True,
+        hide_index=True
     )
 
     st.download_button(
         "⬇ Descargar Excel con UDI-DI",
-        data=download_xlsx(results),
+        data=xlsx(results),
         file_name="UDI_Connect_resultados.xlsx",
         mime=(
             "application/vnd.openxmlformats-officedocument."
@@ -505,7 +590,14 @@ if st.session_state.results:
         use_container_width=True
     )
 
+else:
+    st.info(
+        "Todavía no hay resultados. "
+        "Prueba primero la conexión."
+    )
+
 st.caption(
-    "Los resultados dependen de la disponibilidad "
-    "y cobertura de la API pública de EUDAMED."
+    "Los datos dependen del servicio público "
+    "de EUDAMED. No se generan UDI-DI "
+    "sin coincidencias comprobadas."
 )
